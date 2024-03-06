@@ -8,12 +8,14 @@ RUN apt-get update; apt-get -y upgrade;\
     rm -rf /tmp/*
 RUN apt-get -y install apt-utils git
 RUN apt-get -y install curl
+RUN apt-get -y install wget
 RUN apt-get -y install maven && apt-get clean
 
 RUN mkdir /git
 # Install git packages
 # Add idnits
 RUN cd /git && git clone https://github.com/ietf-tools/idnits.git
+ENV PATH="${PATH}:/git/idnits"
 ENV PATH $PATH:/git/idnits
 
 # Add rfcstrip
