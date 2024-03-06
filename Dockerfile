@@ -38,8 +38,8 @@ RUN cd /git/aspell/aspell-0.60.8.1 && ./configure && make && make install
 COPY src/aspell/dictionary/aspell6-en-2020.12.07-0.tar.bz2 /git/aspell
 RUN mkdir /usr/local/lib/aspell
 COPY src/aspell/dictionary/aspell6-en-2020.12.07-0.tar.bz2 /usr/local/lib/aspell
-RUN cd /git/aspell && tar xvf aspell6-en-2020.12.07-0.tar.bz2 && cd aspell-en-2020-12-07-0 && ./configure && make && make install
 ENV LD_LIBRARY_PATH $LD_LIBRARY_PATH:/usr/local/lib
+RUN cd /git/aspell && tar xvf aspell6-en-2020.12.07-0.tar.bz2 && cd aspell6-en-2020.12.07-0 && ./configure && make && make install
 
 # Install codespell
 RUN pip install codespell
