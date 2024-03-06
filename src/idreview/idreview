@@ -1,0 +1,265 @@
+#! /usr/bin/env bash
+
+# Copyright (C) 2006-2015 Lars Eggert <lars@eggert.org>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms are permitted
+# provided that the above copyright notice and this paragraph are
+# duplicated in all such forms and that any documentation,
+# advertising materials, and other materials related to such
+# distribution and use acknowledge that the software was developed
+# by the author. The name of the author may not be used to endorse
+# or promote products derived from this software without specific
+# prior written permission.
+#
+# THIS SOFTWARE IS PROVidED "AS IS" AND WITHOUT ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE.
+
+# $id: idreview,v 1.22 2010/02/11 14:58:32 eggert Exp $
+
+# needs idnits, rfcstrip, aspell, wget and (optionally) LanguageTool
+# and Fenner's bap/aex
+
+# where LanguageTool lives (http://www.danielnaber.de/languagetool/)
+lt=/usr/local/bin
+
+if [ -z "$1" ]; then
+	echo "usage: $0 internet-draft"
+	exit 1
+fi
+
+# check for interactive flag
+interactive=0
+if [ "$1" = "-i" ]; then
+	interactive=1
+	shift 1
+fi
+
+timeout=20
+id=$(basename -s.txt "$1")
+iddir=$(dirname "$1")
+echo "$id"
+
+# put draft text into subdir, if it's not there yet
+if [ ! -f "$iddir/$id*txt" ]; then
+	echo -n "    fetching"
+	# tools servers are faster than http://www.ietf.org/internet-drafts/
+	wget -t 1 -T $timeout -q -c -P "$iddir" -nd -O "$id.txt" "http://tools.ietf.org/id/$id"
+	echo " - done"
+fi
+
+id=$(basename $iddir/$id*txt)
+idtag=$(basename "$id" | sed "s/[.]txt//")
+mktemp="mktemp /tmp/$(basename "$0")-XXXXXXXXXX"
+
+# keep a stripped version around, to save some time
+stripid=$($mktemp)
+rfcstrip "$iddir/$id" > "$stripid"
+
+# run idnits, if it hasn't been
+function nits () {
+	nits=$iddir/nits-$id
+	[ -f "$nits" ] && return
+	idnits --verbose "$iddir/$id" > "$nits" 2>&1
+	result=$(grep Summary: "$nits" | cut -d: -f2)
+	[ "$result" ] && echo "    idnits -$result"
+}
+
+# if we are in interactive mode, spell check interactively first,
+# to train the dictionary with any new words that the draft contains
+# and to insert misspellings into the review as nits
+# (non-interactive mode is handled by idnits now)
+function review () {
+	review=$iddir/$(echo "$id" | sed -e "s/draft-/review-/")
+
+	# check if an older review exists
+	wc=$(wc -l "$review" 2> /dev/null | sed -E 's/ *([0-9]+).*/\1/')
+	[ "${wc:-0}" -gt 3 ] && return
+
+	cat > "$review"  - <<-EOS
+		COMMENT: Note: Most comments marked as "nits" below have been
+		automatically flagged by review scripts - there may be some
+		false positives in there.
+
+	EOS
+
+	if [ $interactive -eq 0 ]; then
+		# generate blank idcomments review, if it's not there yet
+		cat "$iddir/$id" >> "$review"
+		return
+	fi
+
+	# interactive
+	temp=$($mktemp)
+	aspell -b -c "$iddir/$id"
+	if [ -f "$iddir/$id.bak" ]; then
+		wdiff "$iddir/$id.bak" "$iddir/$id" | \
+			sed -e :a -e '/\[-.*\-\]$/N; s/\n */ /; ta' | \
+			perl -ne '
+				$comment = "";
+				while (s/\[-(.*?)-\]\s+\{\+(.*?)\+\}/$1/) {
+					$nit = "Nit: s/$1/$2/\n";
+					if ($comment) {
+						$comment .= "\t$nit";
+					} else {
+						$comment = "COMMENT: $nit";
+					}
+				}
+				if ($comment) {
+					print $_ . "$comment\n";
+				} else {
+					print;
+				}' > "$temp"
+		mv "$iddir/$id.bak" "$iddir/$id"
+
+		# warn if the sed hack above failed
+		grep -c '{+' "$iddir/$id" > /dev/null
+		[ $? -eq 0 ] && echo "XXX check $idtag for {+ manually" && exit
+
+		# generate idcomments review with misspellings
+		cat "$temp" >> "$review"
+	else
+		# generate blank idcomments review, if it's not there yet
+		cat "$iddir/$id" >> "$review"
+		return
+	fi
+	rm "$temp"
+}
+
+# grammar check, if it hasn't been
+function grammar () {
+	gram=$iddir/grammar-$id
+	[ ! -d $lt -o -f "$gram" ] && return
+
+	echo -e "LINE NUMBERS MAY BE WRONG DUE TO PRE-PROCESSING.\n" > "$gram"
+	sed -e 's/^[ ]\{1,\}//g; s/[ ]\{2,\}/ /g; s/^o /\* /' "$stripid" | \
+	languagetool -l en-US -d WHITESPACE_RULE,EN_QUOTES,\
+COMMA_PARENTHESIS_WHITESPACE,UPPERCASE_SENTENCE_START,\
+THREE_NN,DOUBLE_PUNCTUATION,WORD_CONTAINS_UNDERSCORE,COPYRIGHT,\
+DASH_RULE,PLUS_MINUS,MULTIPLICATION_SIGN,ARROWS,\
+PUNCTUATION_PARAGRAPH_END >> "$gram"
+	echo "    grammar"
+}
+
+# check ABNF, if it hasn't been
+function abnf () {
+	abnf=$iddir/abnf-$id
+	[ -f "$abnf" ] && return
+	aex "$iddir/$id" > "$abnf"
+	if [ -s "$abnf" ]; then
+		normalized=$($mktemp)
+		bap < "$abnf" > "$normalized" 2>&1
+		cat >> "$abnf" - "$normalized" <<-EOS
+
+			--------------------------------------------------------
+			NORMALIZED ABNF:
+
+		EOS
+		grep -c error: "$normalized" > /dev/null
+		[ $? -eq 0 ] && echo '    ABNF - error'
+		rm "$normalized"
+	else
+		rm "$abnf"
+	fi
+}
+
+# validate XML parts of the draft - beta
+function xml () {
+	xml=$iddir/xml-$id
+	[ -f "$xml" ] && return
+	temp=$($mktemp)
+
+	# split the draft into fragments that start with an XML statement
+	csplit -k -f "$temp" -s - '/<\?xml/' '{9999}' < "$stripid" 2> /dev/null
+
+	# the first file fragment has no XML sed -e 's/^[ 	]*//' |
+	rm "$temp" "${temp}00"
+	[ ! -s "${temp}01" ] && return
+	for file in ${temp}*; do
+		# remove line prefix before "<?xml"
+		pre=$(head -n1 "$file" | awk '{ print index($0, "<?xml") }')
+		xmlfile=$($mktemp)
+		cut -c "${pre}-" "$file" > "$xmlfile"
+
+		# check the well-formedness of the XML fragment
+		report=$($mktemp)
+		xmllint "$xmlfile" 2> "$report" > "$report"
+
+		# use the warning about extra content to extract the
+		# XML, when possible (XXX sometimes fails)
+		xmlsnip=$($mktemp)
+		len=$(grep "Extra content at the end of the document" "$report" |
+			cut -f2 -d:)
+		if [ "$len" ]; then
+			head -n $(("$len" - 1)) "$xmlfile" > "$xmlsnip"
+		else
+			cp "$xmlfile" "$xmlsnip"
+		fi
+
+		# append report for fragment to report for draft
+		awk '{
+			if (/Extra content at the end of the document/) {
+				getline; getline; getline
+			} else {
+				print
+			}
+		}' "$report" | sed -e "s|$xmlfile:|line |" >> "$xml"
+
+		echo >> "$xml"
+		nl -b a -p "$xmlsnip" >> "$xml"
+		rm "$report" "$file" "$xmlfile" "$xmlsnip"
+	done
+	echo "    XML"
+}
+
+# check if all non-example URIs are retrievable
+function uri () {
+	uri=$iddir/uri-$id
+	[ -f "$uri" ] && return
+
+	temp=$($mktemp)
+#	XXX this sed command can hang?!
+#	tr -d '\n' | sed -E "s/- +/-/g; s/: +/ /g" < "$stripid" |
+	tr -d '\n' < "$stripid" |
+		urifind -un -S http -S https -S ftp 2> /dev/null |
+		grep -Ev "example.(com|net|org)|.(test|invalid|example|localhost)|www.ietf.org/((ietf/)?1id-abstracts.(html|txt)|shadow.html|ipr)|trustee.ietf.org/license-info" > "$temp"
+
+	[ ! -s "$temp" ] && return
+	for u in $(cat "$temp"); do
+		wget -nv -t 1 -T $timeout --spider --no-check-certificate \
+			"$u" 2>&1 | head -n 1 >> "$uri"
+	done
+	rm "$temp"
+	if [ -s "$uri" ]; then
+		grep -v '200 OK$' "$uri" > /dev/null
+		[ "$?" -eq 0 ] && echo "    URIs - error"
+	fi
+}
+
+# if this is a bis, rfcdiff it against the original RFC
+function bis () {
+	bis="$iddir/bis-$id.html"
+	[ -f "$bis" ] && return
+
+	echo "$id" | grep -E "[[:digit:]]+-?(bis|update)" > /dev/null
+	[ $? -ne 0 ] && return
+	echo "    BIS"
+	rfc=$(echo "$id" | sed -E "s/.*[^[:digit:]]([[:digit:]]+)-?(bis|update).*/\1/")
+	[ "$rfc" -lt 1000 ] && rfc=0$rfc
+	[ -f "$iddir/rfc$rfc.txt" ] || wget -P "$iddir" -nc -t 1 -T "$timeout" -q \
+		"http://tools.ietf.org/rfc/rfc$rfc.txt"
+	rfcdiff --stdout "$iddir/rfc$rfc.txt" "$iddir/$id" 2> /dev/null > "$bis"
+}
+
+nits &
+grammar &
+# abnf &
+xml &
+uri &
+bis &
+wait
+review
+
+rm "$stripid"
